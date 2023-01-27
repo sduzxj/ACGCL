@@ -80,7 +80,65 @@ class Pool(nn.Module):
             x1, _, _, batch, _, _ = self.sag_pool(x, edge, batch=batch)
             return global_mean_pool(x1, batch)
             
+class Encoder_gcl(nn.Module):
+    def __init__(self, in_channels, out_channels, k, skip=True):
+        super(Encoder_gcl, self).__init__()
+        self.base_model = GCNConv
+        assert k >= 2
+        self.k = k
+        self.skip = skip
+        if not self.skip:
+            # self.conv = [base_model(in_channels, 2 * out_channels).jittable()]
+            self.conv = [self.base_model(in_channels, 2 * out_channels)]
+            for _ in range(1, k - 1):
+                self.conv.append(self.base_model(2 * out_channels, 2 * out_channels))
+            self.conv.append(self.base_model(2 * out_channels, out_channels))
+            self.conv = nn.ModuleList(self.conv)
+
+            self.activation = nn.PReLU(out_channels)
+        else:
+            self.fc_skip = nn.Linear(in_channels, out_channels)
+            self.conv = [self.base_model(in_channels, out_channels)]
+            for _ in range(1, k):
+                self.conv.append(self.base_model(out_channels, out_channels))
+            self.conv = nn.ModuleList(self.conv)
+
+            self.activation = nn.PReLU(out_channels)
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor):
+        if not self.skip:
+            for i in range(self.k):
+                x = self.activation(self.conv[i](x, edge_index))
+            return x
+        else:
+            h = self.activation(self.conv[0](x, edge_index))
+            hs = [self.fc_skip(x), h]
+            for i in range(1, self.k):
+                u = sum(hs)
+                hs.append(self.activation(self.conv[i](u, edge_index)))
+            return hs[-1]            
         
+class GraphSAGE_GCN(torch.nn.Module):
+    def __init__(self, input_dim, layer_num=3, hidden=512):
+        super().__init__()
+        self.convs = torch.nn.ModuleList()
+        self.layer = layer_num
+        self.acts = torch.nn.ModuleList()
+        self.norms = torch.nn.ModuleList()
+
+        for i in range(self.layer):
+            if i == 0:
+                self.convs.append(SAGEConv(input_dim, hidden, root_weight=True))
+            else:
+                self.convs.append(SAGEConv(hidden, hidden, root_weight=True))
+            # self.acts.append(torch.nn.PReLU(hidden))
+            self.acts.append(torch.nn.ELU())
+            self.norms.append(torch.nn.BatchNorm1d(hidden))
+            
+    def forward(self, x,edge_index):
+        for i in range(self.layer):
+            x = self.acts[i](self.norms[i](self.convs[i](x, edge_index)))
+        return x        
 
 
 class Scorer(nn.Module):
