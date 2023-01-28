@@ -150,19 +150,21 @@ class Scorer(nn.Module):
         output = torch.sigmoid(torch.sum(input1 * torch.matmul(input2, self.weight), dim = -1))
         return output
 
-
 class SubgraphModel(torch.nn.Module):
 
-    def __init__(self, hidden_channels, encoder, pool, scorer):
-        super(SubgraphModel, self).__init__()
+    def __init__(self, hidden_channels, encoder, pool, scorer, margin=0.55,num_proj_hidden=256):#0.55
+        super(SugbCon, self).__init__()
         self.encoder = encoder
         self.hidden_channels = hidden_channels
         self.pool = pool
         self.scorer = scorer
-        self.marginloss = nn.MarginRankingLoss(0.5)
-        self.marginloss_fn = nn.MarginRankingLoss(0.5,reduction ='none')
+        self.marginloss = nn.MarginRankingLoss(margin)#7
+        self.marginloss_fn = nn.MarginRankingLoss(margin,reduction ='none')
         self.sigmoid = nn.Sigmoid()
         self.reset_parameters()
+        self.fc1 = torch.nn.Linear(hidden_channels, num_proj_hidden)
+        self.fc2 = torch.nn.Linear(num_proj_hidden, hidden_channels)
+        self.tau = 0.5
         #self.Linear(hidden_channels,1)
         
     def reset_parameters(self):
@@ -178,7 +180,10 @@ class SubgraphModel(torch.nn.Module):
         
         z = hidden[index]
         summary = self.pool(hidden, edge_index, batch)
+        #z=torch.nn.functional.normalize(z,dim=1)
+        #summary=torch.nn.functional.normalize(summary)
         return z, summary
+    
     
     def loss(self, hidden1, summary1):
         r"""Computes the margin objective."""
@@ -227,7 +232,7 @@ class SubgraphModel(torch.nn.Module):
         val_acc = clf.score(val_z.detach().cpu().numpy(), val_y.detach().cpu().numpy())
         test_acc = clf.score(test_z.detach().cpu().numpy(), test_y.detach().cpu().numpy())
         return val_acc, test_acc
-    '''
+    
     def test_f1(self, train_z, train_y, val_z, val_y, test_z, test_y, solver='lbfgs',
              multi_class='auto', *args, **kwargs):
         r"""Evaluates latent space quality via a logistic regression downstream task."""        
@@ -238,4 +243,70 @@ class SubgraphModel(torch.nn.Module):
         pro_val_y=clf.predict(val_z.detach().cpu().numpy())
         val_acc = f1_score(pro_val_y, val_y.detach().cpu().numpy(),average='micro')
         test_acc = f1_score(pro_t_y, test_y.detach().cpu().numpy(),average='micro')
-        return val_acc, test_acc'''
+        return val_acc, test_acc
+
+##############################################################
+    def projection(self, z: torch.Tensor) -> torch.Tensor:
+        z = F.elu(self.fc1(z))
+        return self.fc2(z)
+
+    def sim(self, z1: torch.Tensor, z2: torch.Tensor):
+        z1 = F.normalize(z1)
+        z2 = F.normalize(z2)
+        return torch.mm(z1, z2.t())
+
+    def semi_loss(self, z1: torch.Tensor, z2: torch.Tensor):
+        f = lambda x: torch.exp(x / self.tau)
+        refl_sim = f(self.sim(z1, z1))
+        between_sim = f(self.sim(z1, z2))
+
+        return -torch.log(between_sim.diag() / (refl_sim.sum(1) + between_sim.sum(1) - refl_sim.diag()))
+
+    def batched_semi_loss(self, z1: torch.Tensor, z2: torch.Tensor, batch_size: int):
+        # Space complexity: O(BN) (semi_loss: O(N^2))
+        device = z1.device
+        num_nodes = z1.size(0)
+        num_batches = (num_nodes - 1) // batch_size + 1
+        f = lambda x: torch.exp(x / self.tau)
+        indices = torch.arange(0, num_nodes).to(device)
+        losses = []
+
+        for i in range(num_batches):
+            mask = indices[i * batch_size:(i + 1) * batch_size]
+            refl_sim = f(self.sim(z1[mask], z1))  # [B, N]
+            between_sim = f(self.sim(z1[mask], z2))  # [B, N]
+
+            losses.append(-torch.log(between_sim[:, i * batch_size:(i + 1) * batch_size].diag()
+                                     / (refl_sim.sum(1) + between_sim.sum(1)
+                                        - refl_sim[:, i * batch_size:(i + 1) * batch_size].diag())))
+
+        return torch.cat(losses)
+
+    def loss_grace(self, z1: torch.Tensor, z2: torch.Tensor, mean: bool = True, batch_size: Optional[int] = None):
+        h1 = self.projection(z1)
+        h2 = self.projection(z2)
+
+        if batch_size is None:
+            l1 = self.semi_loss(h1, h2)
+            l2 = self.semi_loss(h2, h1)
+        else:
+            l1 = self.batched_semi_loss(h1, h2, batch_size)
+            l2 = self.batched_semi_loss(h2, h1, batch_size)
+
+        ret = (l1 + l2) * 0.5
+        ret = ret.mean() if mean else ret.sum()
+
+        return ret
+    def loss_grace_fn(self, z1: torch.Tensor, z2: torch.Tensor, mean: bool = True, batch_size: Optional[int] = None):
+        h1 = self.projection(z1)
+        h2 = self.projection(z2)
+
+        if batch_size is None:
+            l1 = self.semi_loss(h1, h2)
+            l2 = self.semi_loss(h2, h1)
+        else:
+            l1 = self.batched_semi_loss(h1, h2, batch_size)
+            l2 = self.batched_semi_loss(h2, h1, batch_size)
+
+        ret = (l1 + l2) * 0.5
+        return ret
