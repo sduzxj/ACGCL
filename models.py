@@ -8,6 +8,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import f1_score
 from torch.nn import Linear
 from torch_geometric.nn import GCNConv, global_mean_pool, global_max_pool, global_add_pool, SAGPooling
+from typing import Optional
 EPS = 1e-15
 
 
@@ -153,7 +154,7 @@ class Scorer(nn.Module):
 class SubgraphModel(torch.nn.Module):
 
     def __init__(self, hidden_channels, encoder, pool, scorer, margin=0.55,num_proj_hidden=256):#0.55
-        super(SugbCon, self).__init__()
+        super(SubgraphModel, self).__init__()
         self.encoder = encoder
         self.hidden_channels = hidden_channels
         self.pool = pool

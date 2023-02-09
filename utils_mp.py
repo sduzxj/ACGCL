@@ -11,9 +11,27 @@ from sklearn.preprocessing import normalize
 from multiprocessing import Pool
 from itertools import combinations
 
-def computecf_graph(self, x,y,edge,thresh=30,subgraph_node_num=20):
+
+def standardize(feat, mask):
+    scaler = StandardScaler()
+    scaler.fit(feat[mask])
+    new_feat = torch.FloatTensor(scaler.transform(feat))
+    return new_feats
+    
+    
+def preprocess(features):
+    rowsum = np.array(features.sum(1))
+    r_inv = np.power(rowsum, -1).flatten()
+    r_inv[np.isinf(r_inv)] = 0.
+    r_mat_inv = sp.diags(r_inv)
+    features = r_mat_inv.dot(features)
+    return torch.tensor(features)
+
+
+def computecf_graph(self, x,y,edge,thresh=30,subgraph_node_num=20,alpha=1):
+    #Calculate the counterfactual graph
             node_embs=x
-            simi_mat = cdist(node_embs, node_embs, 'euclidean')
+            simi_mat = cdist(node_embs, node_embs, 'euclidean')#minkowski
             adjn=x.shape[0]
             edgen=edge[0].shape[0]
             adj=np.zeros([adjn,adjn])
@@ -38,7 +56,7 @@ def computecf_graph(self, x,y,edge,thresh=30,subgraph_node_num=20):
                     nns_b = node_nns[b]
                     i, j = 0, 0
                     while i < len(nns_a)-1 and j < len(nns_b)-1:
-                        if simi_mat[a, nns_a[i]] + simi_mat[b, nns_b[j]] > thresh:
+                        if simi_mat[a, nns_a[i]] + simi_mat[b, nns_b[j]] > alpha*thresh:
                             #T_cf[a, b] = T_f[a, b]
                             adj_cf[a, b] = adj[a, b]
                             if adj_cf[a, b]==1:
@@ -48,21 +66,14 @@ def computecf_graph(self, x,y,edge,thresh=30,subgraph_node_num=20):
                                 edges_cf_t1b.append(b)
                             break
                         if [y[nns_a[i]], y[nns_b[j]]] != [y[a], y[b]]:
-                            #T_cf[a, b] = 1 - T_f[a, b] # T_f[nns_a[i], nns_b[j]] when treatment not binary
                             adj_cf[a, b] = adj[nns_a[i], nns_b[j]]
-                            #if T_cf[a, b] == 0:
                             if adj_cf[a, b]==1:
-                              #edges_cf_t0.append([a, b])
                               edges_cf_t0a.append(a)
                               edges_cf_t0b.append(b)
-                            #else:
-                            #    edges_cf_t1.append([nns_a[i], nns_b[j]])
                             break
                         if [y[nns_a[i]], y[nns_b[j]]] == [y[a], y[b]]:
                             adj_cf[a, b] = adj[a, b]
-                            #if T_cf[a, b] == 0:
                             if adj_cf[a, b]==1:
-                             #edges_cf_t1.append([a, b])
                               edges_cf_t1a.append(a)
                               edges_cf_t1b.append(b)
                         if simi_mat[a, nns_a[i+1]] < simi_mat[b, nns_b[j+1]]:
@@ -73,21 +84,6 @@ def computecf_graph(self, x,y,edge,thresh=30,subgraph_node_num=20):
             ecf0=torch.IntTensor([edges_cf_t0a,edges_cf_t0b]).type(torch.long)
             ecf1=torch.IntTensor([edges_cf_t1a,edges_cf_t1b]).type(torch.long)
             return ecf1,ecf0
-def standardize(feat, mask):
-    scaler = StandardScaler()
-    scaler.fit(feat[mask])
-    new_feat = torch.FloatTensor(scaler.transform(feat))
-    return new_feats
-    
-    
-def preprocess(features):
-    rowsum = np.array(features.sum(1))
-    r_inv = np.power(rowsum, -1).flatten()
-    r_inv[np.isinf(r_inv)] = 0.
-    r_mat_inv = sp.diags(r_inv)
-    features = r_mat_inv.dot(features)
-    return torch.tensor(features)
-
 
 class PPR:
     #Node-wise personalized pagerank
@@ -219,45 +215,16 @@ class Subgraph:
             x = self.adjust_x(nodes)
             edge = self.adjust_edge(nodes)
             y = self.adjust_y(nodes)
-            #print(edge.shape)
-            #print(edge[0].shape)
-
             self.subgraph[i] = Data(x, edge, y=y)
-            #print(self.subgraph[i].x.shape[0])
-            #print(self.node_num)
-            #print(i)
-
             #subcf_pos_edge,subcf_neg_edge=computecf_graph(self,x=self.subgraph[i].x,y=y,edge=edge)
             #self.subgraph_pos[i]=Data(x,subcf_pos_edge)
             #self.subgraph_neg[i]=Data(x,subcf_neg_edge)
         torch.save(self.subgraph, self.path+'_subgraph')
         #torch.save(self.subgraph_pos, self.path+'_subgraph_pos')
         #torch.save(self.subgraph_neg, self.path+'_subgraph_neg')
-
-    def search(self, node_list):
-        #Extract subgraphs for nodes in the list
-        batch = []
-        index = []
-        
-        batch_pos = []
-        batch_neg=[]
-        
-        size = 0
-        for node in node_list:
-            batch.append(self.subgraph[node])
-            batch_pos.append(self.subgraph_pos[node])
-            batch_neg.append(self.subgraph_neg[node])
-            index.append(size)
-            size += self.subgraph[node].x.size(0)
-        index = torch.tensor(index)
-        batch = Batch().from_data_list(batch)
-        batch_pos = Batch().from_data_list(batch_pos)
-        batch_neg = Batch().from_data_list(batch_neg)
-
-        return batch, index,batch_pos,batch_neg
         
     def counterfactual_search(self, node_list,thresh=30):
-        #Extract subgraphs for nodes in the list
+        #Extract subgraphs and the corresponding counterfactual graphs for nodes in the list
         batch = []
         index = []
         
@@ -279,15 +246,8 @@ class Subgraph:
             y.append(self.subgraph[node].y)
             size += self.subgraph[node].x.size(0)
         index = torch.tensor(index)
-        #y=torch.tensor(y)
         batch = Batch().from_data_list(batch)
         batch_pos = Batch().from_data_list(batch_pos)
         batch_neg = Batch().from_data_list(batch_neg)
 
         return batch, index,batch_pos,batch_neg,y
-    
-    
-    
-   
-
-
