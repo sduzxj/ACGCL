@@ -7,11 +7,12 @@ from torch_geometric.datasets import Planetoid
 import torch_geometric.transforms as T
 
 from utils_mp import Subgraph, preprocess
-from models import Encoder, Scorer, Pool,Encoder2,SubgraphModel
+from models import Encoder, Encoder2, Encoder_gcl, Scorer, Pool,SubgraphModel
 from geomloss import SamplesLoss
-from function import spl_loss,balance_loss,geom_progression,linear,root_2,increase_threshold
+from functional import spl_loss,balance_loss,geom_progression,linear,root_2,increase_threshold
 torch.manual_seed(1024)
-MAX=80
+MAX=100
+low_bound=1e-3
     
 def get_parser():
     parser = argparse.ArgumentParser(description='Description: Script to run our model.')
@@ -22,8 +23,8 @@ def get_parser():
     parser.add_argument('--hidden_size', type=int, help='hidden size', default=1024)
     parser.add_argument('--method', help='', default='our_soft')
     
-    parser.add_argument('--pre_epoch', type=int, help='pre epoch', default=0)
-    parser.add_argument('--easy_epoch', type=int, help='easy epoch', default=5)
+    parser.add_argument('--pre_epoch', type=int, help='pre epoch', default=-1)
+    parser.add_argument('--easy_epoch', type=int, help='easy epoch', default=-1)
     parser.add_argument('--hard_epoch', type=int, help='hard epoch', default=50)
     parser.add_argument('--disc_func', type=str, default='w', choices=['lin', 'kl', 'w'], help='distance function for Subgraph distribution balance loss')
     return parser
@@ -61,7 +62,7 @@ if __name__ == '__main__':
             sample_idx = random.sample(range(data.x.size(0)), args.batch_size)
             ### Curriculum Learning Scheme
             if epoch<=args.pre_epoch:
-                batch, index,batch_pos, batch_neg,y = subgraph.counterfactual_search(sample_idx,30)
+                batch, index,batch_pos, batch_neg,y = subgraph.counterfactual_search(sample_idx,30)##########30
                 #print(y)
                 z, summary = model(batch.x.cuda(), batch.edge_index.cuda(), batch.batch.cuda(), index.cuda())
                 loss = model.loss(z, summary)
@@ -69,42 +70,38 @@ if __name__ == '__main__':
                 optimizer.step()
             else:
                 if epoch<args.easy_epoch:
-                 batch, index,batch_pos, batch_neg,y = subgraph.counterfactual_search(sample_idx,30)
+                 batch, index,batch_pos, batch_neg,y = subgraph.counterfactual_search(sample_idx,5)
                 if epoch>=args.easy_epoch and epoch<args.hard_epoch:
                  rate=MAX*geom_progression(epoch-args.easy_epoch,args.hard_epoch-args.easy_epoch,30/MAX)
                  batch, index,batch_pos, batch_neg,y = subgraph.counterfactual_search(sample_idx,rate)
                  #print(rate)
                 else :
                  batch, index,batch_pos, batch_neg,y = subgraph.counterfactual_search(sample_idx,MAX)
-                threshold=1.7586436867713928
-                threshold1=0.872938121395111
+                batch_x=batch.x.cuda()
+                batch_edge_index=batch.edge_index.cuda()
+                batch_batch=batch.batch.cuda()
+                index=index.cuda()
+                batch_pos=batch_pos.cuda()
+                batch_neg=batch_neg.cuda()
+                z, summary = model(batch_x, batch_edge_index, batch_batch, index)
+                z1, summary2 = model(batch_x, batch_pos.edge_index, batch_batch, index)
+                z2, summary3 = model(batch_x, batch_neg.edge_index, batch_batch, index)
+                loss_temp = model.loss_fn(z, summary)+torch.nn.functional.triplet_margin_loss(z,z1,z2,reduction='none')
+                threshold=np.percentile(np.sort(loss_temp.cpu().detach().numpy()), 80)
+                threshold1=np.percentile(np.sort(loss_temp.cpu().detach().numpy()), 20)+low_bound
                 for i in range(4):
-                  batch_x=batch.x.cuda()
-                  batch_edge_index=batch.edge_index.cuda()
-                  batch_batch=batch.batch.cuda()
-                  index=index.cuda()
-                  batch_pos=batch_pos.cuda()
-                  batch_neg=batch_neg.cuda() 
-                  
                   z, summary = model(batch_x, batch_edge_index, batch_batch, index)
                   z1, summary2 = model(batch_x, batch_pos.edge_index, batch_batch, index)
                   z2, summary3 = model(batch_x, batch_neg.edge_index, batch_batch, index)
-                  loss = model.loss_fn(z, summary)+torch.nn.functional.triplet_margin_loss(summary,summary2,summary3,reduction='none')
-                  if epoch==1 and i==0:
-                   loss_temp=loss
-                   threshold=np.percentile(np.sort(loss_temp.cpu().detach().numpy()), 50)
-                   threshold1=np.percentile(np.sort(loss_temp.cpu().detach().numpy()), 1/args.batch_size)*0.7
-                   #print(threshold)
-                   #print(threshold1)
+                  loss = model.loss_fn(z, summary)+torch.nn.functional.triplet_margin_loss(z,z1,z2,reduction='none')
                   v=spl_loss(loss.cuda(),args.batch_size,threshold,threshold1,args.method)
-                  threshold=increase_threshold(threshold)
-                  threshold1=increase_threshold(threshold1,1)
+                  threshold=increase_threshold(threshold,1.1)
+                  threshold1=increase_threshold(threshold1,0.95)
                   active_num=torch.count_nonzero(v)
-                  loss=(torch.matmul(v,loss.T)+balance_loss(args.disc_func,summary,summary2)*0.2+balance_loss(args.disc_func,summary,summary3)*0.2)/active_num
+                  loss=(torch.matmul(v,loss.T)+balance_loss(args.disc_func,summary,summary2)*0.25+balance_loss(args.disc_func,summary,summary3)*0.25)/active_num
                   loss.backward()
                   optimizer.step()
                   val_acc, test_acc = test(model) 
-                  #print('step_acc'.format(test_acc))
                   if active_num>0.95*args.batch_size:
                         break
                   if active_num<0.1*args.batch_size:
@@ -150,7 +147,7 @@ if __name__ == '__main__':
     best_ts_acc = 0
     max_val = 0
     stop_cnt = 0
-    patience = 25
+    patience = 35
     for epoch in range(10000):
             loss = train(epoch)
             print('epoch = {}, loss = {}'.format(epoch, loss))
@@ -166,7 +163,7 @@ if __name__ == '__main__':
             print('best_val_acc = {}, best_test_acc = {}'.format(best_val_acc, best_ts_acc))
             if stop_cnt >= patience:
                 break
-            #print('best_acc_from_val = {}'.format(best_acc_from_val))
+            print('best_acc_from_val = {}'.format(best_acc_from_val))
 
 
 
